@@ -1,18 +1,5 @@
 ﻿// Win32 Bitmap Visualizer for Expressions 1..9 (ascending)
-// - Enumerates expressions using digits 1..9 in order
-// - Operators: + - * / ^ (and optional concatenation)
-// - Full parenthesization (Catalan) enumeration
-// - Evaluates exactly using Boost big rational: boost::rational<cpp_int>
-// - Marks all integer results n with 1 <= n <= 11111 on a 100x112 dot map
-// - Live display with Start/Cancel and options
-//
-// Build: /DUNICODE /D_UNICODE
-// Needs: Boost headers (multiprecision & rational)
-// e.g., vcpkg install boost-multiprecision boost-rational
-//
-// NOTE: '^' is only applied when the right subexpression is an integer exponent.
-// Negative exponents are supported (as reciprocals) unless base==0.
-// Division by zero makes the expression invalid (skipped).
+// ... (ヘッダー省略) ...
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -41,6 +28,7 @@ enum : int {
     IDC_START = 1001,
     IDC_CANCEL,
     IDC_STATUS,
+    IDC_CURRENT_EXPR,
     IDC_CONCAT_CHECK,
     IDC_OPS_EDIT,
     IDC_MAXMASKS_EDIT,
@@ -55,8 +43,9 @@ static const wchar_t* kDefaultOps = L"+-*/^";
 static const bool     kDefaultConcatOn = true;
 
 // 探索セーフティ（既定値。保守的な値に変更済）
-static const uint32_t kDefaultMaxMasks = 16;  // 連結マスクの上限
-static const uint32_t kDefaultMaxTrees = 2000; // 1構成当たりの括弧木枚数の上限
+static const uint32_t kDefaultMaxMasks = 64;  // 連結マスクの上限
+static const uint32_t kDefaultMaxTrees = 200000; // 1構成当たりの括弧木枚数の上限
+static const BigInt kMaxExponent = 1000000; // 許容する最大指数値
 
 static std::atomic<bool> g_running{ false };
 static std::atomic<bool> g_cancel{ false };
@@ -126,7 +115,7 @@ static BigRat pow_int(const BigRat& a, const BigInt& b, bool& ok) {
     ok = true;
     if (b == 0) return BigRat(1);
 
-    // ★ 修正点1: 開始時のキャンセルチェック
+    // キャンセルチェック
     if (g_cancel.load()) { ok = false; return BigRat(0); }
 
     if (b < 0) {
@@ -137,7 +126,7 @@ static BigRat pow_int(const BigRat& a, const BigInt& b, bool& ok) {
         BigRat res = BigRat(1);
         BigInt e = pos;
         while (e != 0) {
-            // ★ 修正点2: ループ内でのキャンセルチェック
+            // ループ内でのキャンセルチェック
             if (g_cancel.load()) { ok = false; return BigRat(0); }
 
             if ((e & 1) != 0) res *= base;
@@ -150,7 +139,7 @@ static BigRat pow_int(const BigRat& a, const BigInt& b, bool& ok) {
     BigRat res = BigRat(1);
     BigInt e = b;
     while (e != 0) {
-        // ★ 修正点3: ループ内でのキャンセルチェック
+        // ループ内でのキャンセルチェック
         if (g_cancel.load()) { ok = false; return BigRat(0); }
 
         if ((e & 1) != 0) res *= base;
@@ -163,7 +152,12 @@ static BigRat pow_int(const BigRat& a, const BigInt& b, bool& ok) {
 // Evaluate node recursively
 static void eval_node(Node* n) {
     if (!n) return;
+
+    // eval_nodeの再帰開始時のキャンセルチェック (フリーズ対策)
+    if (g_cancel.load()) { n->valid = false; return; }
+
     if (n->isLeaf) return; // leaf already has value
+
     eval_node(n->L.get());
     eval_node(n->R.get());
     if (!n->L->valid || !n->R->valid) { n->valid = false; return; }
@@ -182,10 +176,22 @@ static void eval_node(Node* n) {
         if (B.numerator() == 0) { n->valid = false; return; }
         n->val = A / B; break;
     case L'^':
+        // 1. 指数が整数であることを確認 (分数累乗を排除)
         if (!is_integer(B)) { n->valid = false; return; }
+
+        // 2. 指数が非負の整数であることを確認 (負の整数累乗を排除)
+        if (B.numerator() < 0) { n->valid = false; return; }
+
         {
+            BigInt exponent = B.numerator();
+
+            // 指数が許容最大値を超えていないかチェック
+            if (exponent > kMaxExponent) {
+                n->valid = false; return;
+            }
+
             bool ok = true;
-            n->val = pow_int(A, B.numerator(), ok);
+            n->val = pow_int(A, exponent, ok);
             if (!ok) { n->valid = false; return; }
         }
         break;
@@ -296,11 +302,29 @@ static void genTreesRec(int i, int j,
     }
 }
 
+// -------------- UI Status Helpers ------------------
+// ★ 修正点: set_status と set_current_expr の定義をここに移動
+static void set_status(HWND hWnd, const std::wstring& s) {
+    SetWindowTextW(GetDlgItem(hWnd, IDC_STATUS), s.c_str());
+}
+
+static void set_current_expr(HWND hWnd, const std::wstring& s) {
+    SetWindowTextW(GetDlgItem(hWnd, IDC_CURRENT_EXPR), s.c_str());
+}
+
 // Evaluate all trees, mark integers in [1..11111]
-static void eval_and_mark(std::vector<std::unique_ptr<Node>>& trees, std::vector<uint8_t>& mark) {
+// HWND hWnd を引数に追加
+static void eval_and_mark(std::vector<std::unique_ptr<Node>>& trees, std::vector<uint8_t>& mark, HWND hWnd) {
     for (auto& t : trees) {
         // 各ノードの評価前にキャンセルをチェック
         if (g_cancel.load()) return;
+
+        // 式を表示 (計算直前)
+        set_current_expr(hWnd, t->text);
+        RedrawWindow(GetDlgItem(hWnd, IDC_CURRENT_EXPR), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+
+        // UIスレッドに処理を返す機会を与える (遅延を許容して確実な表示を優先)
+        Sleep(1);
 
         eval_node(t.get());
         if (!t->valid) continue;
@@ -326,9 +350,6 @@ struct WorkerArgs {
     uint32_t maxTrees;    // per (mask, opvector) generation cap
 };
 
-static void set_status(HWND hWnd, const std::wstring& s) {
-    SetWindowTextW(GetDlgItem(hWnd, IDC_STATUS), s.c_str());
-}
 
 static DWORD WINAPI WorkerProc(LPVOID lp) {
     std::unique_ptr<WorkerArgs> u((WorkerArgs*)lp);
@@ -343,6 +364,9 @@ static DWORD WINAPI WorkerProc(LPVOID lp) {
 
     uint64_t evalCount = 0;
     uint32_t lastPaint = GetTickCount();
+
+    // 探索開始時に式の表示領域をクリア
+    set_current_expr(hWnd, L"Starting enumeration...");
 
     for (uint32_t mask = maskBegin; mask < maskEnd && !g_cancel.load(); ++mask) {
         std::vector<std::wstring> operandsStr;
@@ -369,12 +393,14 @@ static DWORD WINAPI WorkerProc(LPVOID lp) {
                 refresh_pixels();
                 // RedrawWindowに変更 (フリーズ対策)
                 RedrawWindow(hWnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
-                WCHAR buf[256];
+                wchar_t buf[256];
                 std::swprintf(buf, 256, L"mask %u/%u | trees(eval)≈ %llu | dots=%u",
                     (unsigned)mask + 1, (unsigned)maskEnd,
                     (unsigned long long)evalCount,
                     (unsigned)std::count(g_map.begin(), g_map.end(), (uint8_t)1));
                 set_status(hWnd, buf);
+                // 単一数の場合は、その数を式として表示
+                set_current_expr(hWnd, operandsStr.empty() ? L"N/A" : operandsStr[0]);
                 lastPaint = now;
             }
             // Sleep(1)を強制 (フリーズ対策)
@@ -393,13 +419,20 @@ static DWORD WINAPI WorkerProc(LPVOID lp) {
             std::vector<std::unique_ptr<Node>> trees;
             uint32_t budget = u->maxTrees;
             bool aborted = false;
+
+            // 全ての式を生成
             genTreesRec(0, k, leaves, ops, trees, budget, aborted);
 
-            // genTreesRec()でキャンセルされたかチェック
-            if (g_cancel.load()) break;
+            // genTreesRec()でキャンセルされたか、または木が一つも生成されなかったらスキップ
+            if (g_cancel.load() || trees.empty()) {
+                if (g_cancel.load()) break; // キャンセルの場合はdo-whileを抜ける
+                Sleep(1);
+                continue;
+            }
 
-            // evaluate and mark
-            eval_and_mark(trees, g_map);
+            // evaluate and mark - 各式を評価する直前に表示を行います
+            // hWndを渡して eval_and_mark 内で UI を更新
+            eval_and_mark(trees, g_map, hWnd);
             evalCount += trees.size();
 
             // eval_and_mark()でキャンセルされたかチェック
@@ -417,6 +450,7 @@ static DWORD WINAPI WorkerProc(LPVOID lp) {
                     (unsigned long long)evalCount,
                     (unsigned)std::count(g_map.begin(), g_map.end(), (uint8_t)1));
                 set_status(hWnd, buf);
+
                 lastPaint = now;
             }
 
@@ -437,6 +471,9 @@ static DWORD WINAPI WorkerProc(LPVOID lp) {
         (unsigned)std::count(g_map.begin(), g_map.end(), (uint8_t)1));
     set_status(hWnd, fin);
 
+    // 探索終了時、式の表示をリセット
+    set_current_expr(hWnd, L"Finished.");
+
     g_running = false;
 
     // 探索終了後にボタンの状態をリセット
@@ -450,7 +487,7 @@ static DWORD WINAPI WorkerProc(LPVOID lp) {
 static void draw_bitmap(HWND hWnd, HDC hdc) {
     RECT rc; GetClientRect(hWnd, &rc);
     // コントロール領域の高さを定義 (描画重なり対策)
-    static const int panelH = 60;
+    static const int panelH = 90;
     int W = rc.right - rc.left;
     int H = rc.bottom - rc.top - panelH; // ビットマップに使用できる高さを計算
 
@@ -485,7 +522,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_bmi.bmiHeader.biCompression = BI_RGB;
 
         int y = 0;
-        // 1行目: Start/Cancel, Concatenation, Ops
+        // 1行目: Start/Cancel, Options (y=10)
         CreateWindowW(L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE, 10, y + 10, 80, 24, hWnd, (HMENU)IDC_START, 0, 0);
         CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_DISABLED, 100, y + 10, 80, 24, hWnd, (HMENU)IDC_CANCEL, 0, 0);
 
@@ -507,9 +544,17 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         CreateWindowW(L"EDIT", mt, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
             930, y + 10, 90, 24, hWnd, (HMENU)IDC_MAXTREES_EDIT, 0, 0);
 
-        // 2行目: Status
+        // 2行目: 現在の式表示 (y=40)
+        CreateWindowW(L"STATIC", L"Expression:", WS_CHILD | WS_VISIBLE,
+            10, y + 40, 90, 18, hWnd, 0, 0, 0);
+        CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY,
+            100, y + 40, 920, 18, hWnd, (HMENU)IDC_CURRENT_EXPR, 0, 0);
+
+        // 3行目: Status (y=65)
+        CreateWindowW(L"STATIC", L"Status:", WS_CHILD | WS_VISIBLE,
+            10, y + 65, 90, 18, hWnd, 0, 0, 0);
         CreateWindowW(L"STATIC", L"Ready.", WS_CHILD | WS_VISIBLE,
-            10, y + 40, 1010, 18, hWnd, (HMENU)IDC_STATUS, 0, 0);
+            100, y + 65, 920, 18, hWnd, (HMENU)IDC_STATUS, 0, 0);
 
         return 0;
     }
@@ -585,7 +630,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_running.load()) {
             if (IDYES == MessageBoxW(hWnd, L"Enumeration is running. Cancel and exit?", L"Confirm", MB_YESNO | MB_ICONQUESTION)) {
                 g_cancel = true;
-                if (g_hWorker) WaitForSingleObject(g_hWorker, 2000);
+                if (g_hWorker) {
+                    WaitForSingleObject(g_hWorker, INFINITE);
+                    CloseHandle(g_hWorker);
+                    g_hWorker = nullptr;
+                }
                 DestroyWindow(hWnd);
             }
             return 0;
