@@ -9,18 +9,19 @@
 #include <memory>
 #include <algorithm>
 #include <chrono>
-#include <thread> 
-#include <cmath> 
-#include <fstream> 
-#include <cstdio>  
-#include <stdexcept> 
-#include <stdio.h> 
+#include <thread>
+#include <cmath>
+#include <fstream>
+#include <cstdio>
+#include <stdexcept>
+#include <stdio.h>
+#include <functional> // for std::function
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 
 // -------- Boost big rational ----------
-#include <boost/multiprecision/cpp_int.hpp> 
+#include <boost/multiprecision/cpp_int.hpp>
 #include <boost/rational.hpp>
 
 using BigInt = boost::multiprecision::cpp_int;
@@ -41,7 +42,7 @@ static const int BMP_H = 112;
 static const int MAX_N = 11111;
 
 static const wchar_t* kDefaultOps = L"+-*/^";
-static const bool     kDefaultConcatOn = true;
+static const bool kDefaultConcatOn = true;
 
 // 固定値として定義された最大値 (Catala数 1430, マスク数 256)
 static const uint32_t kDefaultMaxMasks = 256;
@@ -166,37 +167,70 @@ static void eval_node(Node* n) {
 
     if (n->isLeaf) return;
 
-    eval_node(n->L.get());
-    eval_node(n->R.get());
-    if (!n->L->valid || !n->R->valid) { n->valid = false; return; }
+    // ★修正: べき乗演算子の場合の評価順序を分離
+    if (n->op == L'^') {
+        eval_node(n->L.get());
+        if (!n->L->valid) { n->valid = false; return; }
 
+        const BigRat& A = n->L->val;
+
+        // 1. ベース A が 1 かチェック (1^N = 1 特例)
+        if (A.numerator() == 1 && A.denominator() == 1) {
+            n->val = BigRat(1);
+            // 指数Bの評価はスキップし、有効性はtrueにする
+            // n->R->valid = true; // Rのvalidは変更しない
+            return;
+        }
+
+        // 2. 指数Bの評価を実行
+        eval_node(n->R.get());
+        if (!n->R->valid) { n->valid = false; return; }
+
+    }
+    else {
+        // 通常の二項演算の場合は、両方のオペランドの評価を続行
+        eval_node(n->L.get());
+        eval_node(n->R.get());
+        if (!n->L->valid || !n->R->valid) { n->valid = false; return; }
+    }
+
+    // 両オペランドの評価結果を取得
     const BigRat& A = n->L->val;
-    const BigRat& B = n->R->val;
+    const BigRat& B_val = n->R->val;
 
     switch (n->op) {
     case L'+':
-        n->val = A + B; break;
+        n->val = A + B_val; break;
     case L'-':
-        n->val = A - B; break;
+        n->val = A - B_val; break;
     case L'*':
-        n->val = A * B; break;
+        n->val = A * B_val; break;
     case L'/':
-        if (B.numerator() == 0) { n->valid = false; return; }
-        n->val = A / B; break;
+        if (B_val.numerator() == 0) { n->valid = false; return; }
+        n->val = A / B_val; break;
     case L'^':
-        if (!is_integer(B)) { n->valid = false; return; }
-        if (B.numerator() < 0) { n->valid = false; return; }
+        // 1. 指数が整数であることを確認
+        if (!is_integer(B_val)) { n->valid = false; return; }
 
         {
-            BigInt exponent = B.numerator();
+            BigInt B_int = B_val.numerator();
 
-            if (exponent > kMaxExponent) {
-                n->valid = false; return;
-            }
+            // 符号反転をシミュレートする結果のリスト (指数は正であるべき)
+            BigInt exponent = (B_int < 0) ? -B_int : B_int;
+
+            // 2. 許容最大値を超えていないかチェック
+            if (exponent > kMaxExponent) { n->valid = false; return; }
 
             bool ok = true;
-            n->val = pow_int(A, exponent, ok);
-            if (!ok) { n->valid = false; return; }
+            BigRat current_val = pow_int(A, exponent, ok);
+
+            if (ok) {
+                n->val = current_val;
+            }
+            else {
+                n->valid = false;
+                return;
+            }
         }
         break;
     default:
@@ -204,8 +238,11 @@ static void eval_node(Node* n) {
     }
 
     // 高速化のための枝刈り (Bound Check)
+    // べき乗の結果も含む、全ての中間結果が 200,000 を超える場合はここで枝刈り
     const BigInt max_numerator_threshold = BigInt(200000);
-    if (n->val.denominator() > BigInt(100000) || n->val.numerator() > max_numerator_threshold) {
+    BigInt abs_num = (n->val.numerator() < 0) ? -n->val.numerator() : n->val.numerator();
+
+    if (n->val.denominator() > BigInt(100000) || abs_num > max_numerator_threshold) {
         n->valid = false;
     }
 }
@@ -228,21 +265,25 @@ static void build_operands(uint8_t mask, std::vector<std::wstring>& out) {
 }
 
 // Build leaf nodes (values) from operands strings
+// 修正: 正のオペランドのみを生成するように戻す
 static void make_leaves(const std::vector<std::wstring>& ops, std::vector<std::unique_ptr<Node>>& leaves) {
     leaves.clear();
     leaves.reserve(ops.size());
+
     for (const auto& s : ops) {
-        BigInt v = 0;
+        // 1. 正のオペランドのみを生成
+        BigInt v_pos = 0;
         for (wchar_t c : s) {
-            v *= 10;
-            v += (int)(c - L'0');
+            v_pos *= 10;
+            v_pos += (int)(c - L'0');
         }
-        auto n = std::make_unique<Node>();
-        n->isLeaf = true;
-        n->text = s;
-        n->val = BigRat(v);
-        n->valid = true;
-        leaves.push_back(std::move(n));
+        // 正のノードを追加
+        auto n_pos = std::make_unique<Node>();
+        n_pos->isLeaf = true;
+        n_pos->text = s;
+        n_pos->val = BigRat(v_pos);
+        n_pos->valid = true;
+        leaves.push_back(std::move(n_pos));
     }
 }
 
@@ -256,6 +297,7 @@ static bool nextOpVector(std::vector<int>& idx, int base) {
 }
 
 // Build parenthesized trees over [i..j]
+// leaves は k 個の正のオペランド、ops は k-1 個の演算子を受け取る
 static void genTreesRec(int i, int j,
     const std::vector<std::unique_ptr<Node>>& leaves,
     const std::vector<wchar_t>& ops,
@@ -266,17 +308,14 @@ static void genTreesRec(int i, int j,
     if (g_cancel.load()) { aborted = true; return; }
 
     if (i == j) {
-        auto n = std::make_unique<Node>();
-        n->isLeaf = true;
-        n->text = leaves[i]->text;
-        n->val = leaves[i]->val;
-        n->valid = true;
-        out.push_back(std::move(n));
+        // 葉ノードのディープコピーを追加
+        out.push_back(clone_node(leaves[i]));
         return;
     }
     for (int m = i; m < j; ++m) {
         std::vector<std::unique_ptr<Node>> Ls, Rs;
 
+        // m は leaves のインデックス。ops のインデックスとして使用
         genTreesRec(i, m, leaves, ops, Ls, budgetTrees, aborted);
         if (aborted) return;
 
@@ -290,10 +329,10 @@ static void genTreesRec(int i, int j,
                 --budgetTrees;
 
                 auto n = std::make_unique<Node>();
-                n->op = ops[(size_t)m];
+                n->op = ops[(size_t)m]; // m が ops のインデックスに対応
                 n->isLeaf = false;
 
-                // 文字列構築は遅延させたいが、とりあえず残す
+                // 文字列構築 (L + op + R)
                 n->text.reserve(L->text.size() + R->text.size() + 4);
                 n->text.push_back(L'(');
                 n->text += L->text; n->text.push_back(L' ');
@@ -326,24 +365,35 @@ static void set_current_expr(HWND hWnd, const std::wstring& s) {
 // Evaluate all trees, mark integers in [1..11111]
 static uint64_t eval_and_mark(std::vector<std::unique_ptr<Node>>& trees, std::vector<uint8_t>& mark) {
     uint64_t count = 0;
+
     for (auto& t : trees) {
         if (g_cancel.load()) return count;
 
         eval_node(t.get());
         if (!t->valid) continue;
-        if (!is_integer(t->val)) continue;
-        BigInt n = t->val.numerator();
-        if (n <= 0) continue;
 
-        if (n <= MAX_N) {
+        // 最終結果が整数でない場合は無視
+        if (!is_integer(t->val)) continue;
+
+        BigInt n = t->val.numerator();
+
+        // ゼロまたは負の結果は無視 (N >= 1 のみ許可)
+        if (n < 1) continue;
+
+        BigInt abs_n = n;
+
+        if (abs_n >= 1 && abs_n <= MAX_N) {
+            // 絶対値 (1から11111) にマップ
             int v = 0;
             try {
-                std::string s = n.convert_to<std::string>();
+                std::string s = abs_n.convert_to<std::string>();
                 v = std::stoi(s);
             }
             catch (const std::exception&) {
                 continue;
             }
+
+            // 正しいインデックス範囲内か確認
             if (v >= 1 && v <= MAX_N) {
                 if (mark[(size_t)v] == 0) {
                     mark[(size_t)v] = 1;
@@ -484,67 +534,129 @@ static DWORD WINAPI ParallelWorkerProc(LPVOID lp) {
 
         std::vector<std::wstring> operandsStr;
         build_operands((uint8_t)mask, operandsStr);
-        const int k = (int)operandsStr.size() - 1;
+        // k は元のオペランドの数 (1〜9)
+        const int k = (int)operandsStr.size();
 
-        std::vector<std::unique_ptr<Node>> leaves;
-        make_leaves(operandsStr, leaves);
+        std::vector<std::unique_ptr<Node>> pos_leaves;
+        // make_leaves は k 個の「正の」葉ノードを生成
+        make_leaves(operandsStr, pos_leaves);
 
-        if (k <= 0) {
-            BigInt n = 0;
-            for (wchar_t c : operandsStr[0]) {
-                n *= 10; n += (int)(c - L'0');
-            }
-            if (n >= 1 && n <= MAX_N) {
-                int v = 0;
-                try {
-                    v = std::stoi(n.convert_to<std::string>());
-                }
-                catch (const std::exception&) { continue; }
+        // k <= 1 の場合、単一の葉ノードの結果をチェック
+        if (k <= 1) {
+            if (!pos_leaves.empty()) {
+                BigRat v_rat = pos_leaves[0]->val;
+                BigInt n_pos = v_rat.numerator();
 
-                if (v >= 1 && v <= MAX_N) {
-                    if (g_map[(size_t)v] == 0) {
-                        g_map[(size_t)v] = 1;
-                        g_expressions[(size_t)v] = operandsStr[0];
+                // 1. 正の値のチェック
+                if (n_pos >= 1 && n_pos <= MAX_N) {
+                    int v = 0;
+                    try { v = std::stoi(n_pos.convert_to<std::string>()); }
+                    catch (const std::exception&) {}
+
+                    if (v >= 1 && v <= MAX_N) {
+                        if (g_map[(size_t)v] == 0) {
+                            g_map[(size_t)v] = 1;
+                            g_expressions[(size_t)v] = pos_leaves[0]->text;
+                        }
                     }
                 }
-            }
 
-            // 現在処理中の式を報告 (単一数の場合)
-            if (u->threadIndex < g_current_expressions_by_thread.size()) {
-                g_current_expressions_by_thread[u->threadIndex] = operandsStr[0];
-            }
+                // 2. 負の値（単項マイナス）のチェック。結果の絶対値が 1..MAX_N に入るか
+                BigInt n_neg = -n_pos;
+                BigInt abs_n = (n_neg < 0) ? -n_neg : n_neg;
 
+                if (abs_n >= 1 && abs_n <= MAX_N) {
+                    int v = 0;
+                    try { v = std::stoi(abs_n.convert_to<std::string>()); }
+                    catch (const std::exception&) {}
+
+                    if (v >= 1 && v <= MAX_N) {
+                        std::wstring neg_text = L"(-" + pos_leaves[0]->text + L")";
+                        if (g_map[(size_t)v] == 0) {
+                            g_map[(size_t)v] = 1;
+                            g_expressions[(size_t)v] = neg_text;
+                        }
+                    }
+                }
+
+                // 現在処理中の式を報告 (正の葉ノードの式)
+                if (u->threadIndex < g_current_expressions_by_thread.size()) {
+                    g_current_expressions_by_thread[u->threadIndex] = pos_leaves[0]->text;
+                }
+            }
             continue;
         }
 
-        std::vector<int> idx(k, 0);
+        // k > 1 の場合
+        std::vector<int> idx(k - 1, 0); // 演算子リストは k-1 個
         do {
-            std::vector<wchar_t> ops; ops.resize(k);
-            for (int i = 0; i < k; ++i) ops[i] = u->opsSet[(size_t)idx[i]];
+            if (g_cancel.load()) goto end_mask_loop;
 
-            std::vector<std::unique_ptr<Node>> trees;
+            // k-1 個の演算子を設定
+            std::vector<wchar_t> ops_vec; ops_vec.resize(k - 1);
+            for (int i = 0; i < k - 1; ++i) ops_vec[i] = u->opsSet[(size_t)idx[i]];
+
+            std::vector<std::unique_ptr<Node>> base_trees;
             uint32_t budget = u->maxTrees;
             bool aborted = false;
 
-            genTreesRec(0, k, leaves, ops, trees, budget, aborted);
+            // k 個の正のオペランド (pos_leaves) と k-1 個の演算子でツリー構造を生成
+            genTreesRec(0, k - 1, pos_leaves, ops_vec, base_trees, budget, aborted);
 
-            if (g_cancel.load() || trees.empty()) {
-                if (g_cancel.load()) break;
+            if (g_cancel.load() || base_trees.empty()) {
+                if (g_cancel.load()) goto end_mask_loop;
                 continue;
             }
 
-            // 現在処理中の式を報告 (処理するツリー群の最初の式)
-            if (u->threadIndex < g_current_expressions_by_thread.size() && !trees.empty()) {
-                g_current_expressions_by_thread[u->threadIndex] = trees[0]->text;
+            // --- 単項マイナス（符号反転）の試行 ---
+            // 2^k 通りの符号パターンを試す (k <= 9 なので 512 通り)
+            for (uint32_t sign_mask = 0; sign_mask < (1u << k); ++sign_mask) {
+                if (g_cancel.load()) goto end_mask_loop;
+
+                for (auto& base_tree : base_trees) {
+                    if (g_cancel.load()) goto end_mask_loop;
+
+                    // base_tree のディープコピーを作成
+                    auto current_tree = clone_node(base_tree);
+
+                    // 葉ノードに符号を適用
+                    std::function<void(Node*, uint32_t, int&)> apply_sign_rec =
+                        [&](Node* n, uint32_t mask, int& leaf_idx) {
+                        if (!n) return;
+                        if (n->isLeaf) {
+                            if (leaf_idx < k && (mask & (1u << leaf_idx))) { // 該当ビットが立っている場合、負にする
+                                n->val = -n->val;
+                                // テキストも更新 (例: 123 -> (-123))
+                                n->text = L"(-" + n->text + L")";
+                            }
+                            leaf_idx++;
+                            return;
+                        }
+
+                        apply_sign_rec(n->L.get(), mask, leaf_idx);
+                        apply_sign_rec(n->R.get(), mask, leaf_idx);
+                        };
+
+                    int leaf_index = 0;
+                    apply_sign_rec(current_tree.get(), sign_mask, leaf_index);
+
+
+                    // 現在処理中の式を報告
+                    if (u->threadIndex < g_current_expressions_by_thread.size()) {
+                        g_current_expressions_by_thread[u->threadIndex] = current_tree->text;
+                    }
+
+                    // 評価とマーキング
+                    std::vector<std::unique_ptr<Node>> single_tree_vec;
+                    single_tree_vec.push_back(std::move(current_tree));
+                    uint64_t evaluated_count = eval_and_mark(single_tree_vec, g_map);
+                    u->globalEvalCount->fetch_add(evaluated_count);
+                }
             }
-
-            uint64_t evaluated_count = eval_and_mark(trees, g_map);
-            u->globalEvalCount->fetch_add(evaluated_count);
-
-            if (g_cancel.load()) break;
 
         } while (nextOpVector(idx, opsBase) && !g_cancel.load());
 
+    end_mask_loop:;
         if (g_cancel.load()) break;
     }
 
@@ -791,7 +903,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             uint32_t remaining_masks = maskEnd - actual_mask_start;
             container->totalMasks = maskEnd;
 
-            // ★修正: スレッド数を、保存された論理コア数を最大として利用
+            // 修正: スレッド数を、保存された論理コア数を最大として利用
             unsigned int max_cores = saved_thread_count;
             if (max_cores == 0) max_cores = s_initial_thread_count; // フォールバック
 
@@ -799,9 +911,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             // 実行するスレッド数は、残りのマスク数を超えないように調整
             if (remaining_masks < num_threads) {
-                // 実行スレッド数は残りのタスク数に制限するが、タスクが残っている場合は0にはしない
                 num_threads = remaining_masks;
-                if (num_threads == 0 && remaining_masks > 0) num_threads = 1; // 念のための最小保証
+                // タスクが残っている場合は、最低1スレッドを保証
+                if (num_threads == 0 && remaining_masks > 0) num_threads = 1;
             }
 
             if (num_threads == 0) {
@@ -956,7 +1068,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // 計算中は、マウスオーバー情報がない場合、現在の計算式を表示
             if (g_active_thread_count.load() > 0 && !g_current_expressions_by_thread.empty() && !g_current_expressions_by_thread[0].empty()) {
                 wchar_t buf[1024];
-                _snwprintf(buf, 1024, L"Computing: %s (Check Mask %u)",
+                _snwprintf(buf, 1024, L"Computing: %s (Mask %u)",
                     g_current_expressions_by_thread[0].c_str(), g_current_mask_processing.load());
                 set_current_expr(hWnd, buf);
             }
@@ -1039,6 +1151,7 @@ static void CALLBACK TimerProc(HWND hWnd, UINT msg, UINT_PTR idEvent, DWORD dwTi
         }
 
         // 終了判定ロジック
+        // currentMask は最後に処理を開始したマスクなので、totalMasks に到達した時点で完了とみなす
         bool finished_progress = (currentMask >= totalMasks);
 
         if (all_finished && (g_cancel.load() || finished_progress)) {
@@ -1121,7 +1234,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
 
-    HWND hWnd = CreateWindowW(cls, L"10958",
+    HWND hWnd = CreateWindowW(cls, L"1..9 Expressions → 1..11111 Dot Map (Persistence Mode)",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1100, 760,
         nullptr, nullptr, hInst, nullptr);
